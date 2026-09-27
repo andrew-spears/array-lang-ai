@@ -34,13 +34,24 @@ section arr
   | var : Nat → Dim -- variable dimension. Nat is just an index
   deriving DecidableEq, BEq, Repr
 
+  /- The shape of an array: an optional leading shape variable followed by known
+  dimensions, i.e. `⟨some α, [2, 3]⟩` denotes `α ++ [2, 3]` and has rank `|α| + 2`.
+  The variable sits at the *front* because that is where broadcasting frames go:
+  a function on cells of shape `s` lifts to arrays of shape `frame ++ s`. -/
+  structure Shape where
+    svar : Option Nat := none
+    dims : List Dim := []
+  deriving DecidableEq, BEq, Repr
+
+  def Shape.ofDims (ds : List Dim) : Shape := ⟨none, ds⟩
+
   inductive BaseType where
-  | arr (m n : Dim) -- type includes the shape
+  | arr (s : Shape) -- type includes the shape
   deriving DecidableEq, BEq, Repr
 
   def getType (c : Const) : BaseType := -- the canonical mapping of constants to their types
     match c with
-    | .matrix m n _ => .arr (Dim.const m) (Dim.const n)
+    | .matrix m n _ => .arr (Shape.ofDims [Dim.const m, Dim.const n])
 
 section arr_syntax
   /- Surface syntax, so we can write `[lang| fun x => if x then 1 else 0]`
@@ -103,7 +114,7 @@ instance [BEq ε] [BEq α] : BEq (Except ε α) where
     | .error a, .error b => a == b
     | _, _ => false
 
-abbrev InferM := StateT (Nat × Nat) Error -- Monad to thread the next fresh type var and dimension var, along with failures.
+abbrev InferM := StateT (Nat × Nat × Nat) Error -- Monad to thread the next fresh type / dimension / shape var, along with failures.
 
 inductive TypeAtom where -- leaves of an OpenType
 | const : BaseType → TypeAtom -- known type, with variable dimensions
@@ -115,21 +126,27 @@ abbrev OpenType := type TypeAtom -- may contain TVars; not a 'real' type in the 
 structure Vars where
   tys : List Nat
   dims : List Nat
+  shapes : List Nat := []
 deriving Repr, BEq
-def Vars.empty : Vars := ⟨[], []⟩
+def Vars.empty : Vars := ⟨[], [], []⟩
 def Vars.union (a b : Vars) : Vars :=
-  ⟨(a.tys ++ b.tys).eraseDups, (a.dims ++ b.dims).eraseDups⟩
+  ⟨(a.tys ++ b.tys).eraseDups, (a.dims ++ b.dims).eraseDups, (a.shapes ++ b.shapes).eraseDups⟩
 def Vars.removeAll (a b : Vars) : Vars :=
-  ⟨a.tys.removeAll b.tys, a.dims.removeAll b.dims⟩
+  ⟨a.tys.removeAll b.tys, a.dims.removeAll b.dims, a.shapes.removeAll b.shapes⟩
 
 def Dim.Vars (d : Dim) : Vars :=
   match d with
-  | .var x => Vars.mk [] [x]
+  | .var x => ⟨[], [x], []⟩
   | .const _ => Vars.empty
+def Shape.Vars (s : Shape) : Vars :=
+  let dimVars := s.dims.foldl (fun acc d => acc.union d.Vars) Vars.empty
+  match s.svar with
+  | some a => dimVars.union ⟨[], [], [a]⟩
+  | none => dimVars
 def type.Vars (t : OpenType) : Vars :=
   match t with
-  | .base (.var x) => Vars.mk [x] []
-  | .base (.const (.arr m n)) => Vars.union m.Vars n.Vars
+  | .base (.var x) => ⟨[x], [], []⟩
+  | .base (.const (.arr s)) => s.Vars
   | .arrow t1 t2 => Vars.union t1.Vars t2.Vars
 
 /- universally quantified type, e.g. ∀ 'a, 'a -> 'a.
@@ -159,7 +176,9 @@ section open_type_syntax
 
   declare_syntax_cat ty
 
-  syntax "(" dim ", " dim ")" : ty                -- matrix of shape m, n
+  syntax "(" dim,* ")" : ty                       -- array of known rank, e.g. (2, 3, #0)
+  syntax "(" "*" num (", " dim)* ")" : ty         -- array with a leading shape variable, e.g. (*0, 3)
+  syntax "(" "*" "(" term ")" (", " dim)* ")" : ty -- shape variable from a runtime Nat
   syntax "?" num : ty                             -- type variable, e.g. ?0
   syntax "?" "(" term ")" : ty                    -- type variable from a runtime Nat, e.g. ?(t')
   syntax "~" "(" term ")" : ty                    -- splice in a whole OpenType, e.g. ~(t1)
@@ -174,14 +193,19 @@ section open_type_syntax
     | _ => Lean.Macro.throwUnsupported
 
   macro_rules
-  | `([ty| ($m:dim, $n:dim)])   => do
-      let m ← expandDim m
-      let n ← expandDim n
-      `(type.base (TypeAtom.const (BaseType.arr $m $n)))
+  | `([ty| ($ds:dim,*)])   => do
+      let ds ← ds.getElems.mapM expandDim
+      `(type.base (TypeAtom.const (BaseType.arr ⟨none, [$[$ds],*]⟩)))
+  | `([ty| (*$a:num $[, $ds:dim]*)])   => do
+      let ds ← ds.mapM expandDim
+      `(type.base (TypeAtom.const (BaseType.arr ⟨some $a, [$[$ds],*]⟩)))
+  | `([ty| (*($a:term) $[, $ds:dim]*)])   => do
+      let ds ← ds.mapM expandDim
+      `(type.base (TypeAtom.const (BaseType.arr ⟨some $a, [$[$ds],*]⟩)))
   | `([ty| ?$n:num])    => `(type.base (TypeAtom.var $n))
   | `([ty| ?($t:term)]) => `(type.base (TypeAtom.var $t))
   | `([ty| ~($t:term)]) => `($t)
-  | `([ty| ($t)])       => `([ty| $t])
+  | `([ty| ($t:ty)])    => `([ty| $t])
   | `([ty| $a -> $b])   => `(type.arrow [ty| $a] [ty| $b])
 
   #check [ty| (#0, #1) -> (#1, #2) -> (#0, #2)] -- matrix product
@@ -189,6 +213,10 @@ section open_type_syntax
   #check [ty| (2, 3)]
   #check [ty| ?0 -> ?1 -> ?0]
   #check [ty| ((#0, 3) -> (#0, 1)) -> ?2]
+  #check [ty| (2, 3, 4, 5)]                       -- rank 4
+  #check [ty| ()]                                 -- rank 0, a scalar
+  #check [ty| (*0) -> (*0)]                       -- rank polymorphic
+  #check [ty| (*0, #1) -> (*0)]                   -- reduce the last axis
   -- #check [ty| (#())]
 
   /- Print types back in the `[ty| ...]` surface syntax rather than as raw
@@ -204,9 +232,17 @@ section open_type_syntax
   --   toString
   --     | BaseType.arr m n => s!"({m}, {n})"
 
+  instance : ToString Shape where
+    toString s :=
+      let ds := s.dims.map toString
+      let parts := match s.svar with
+        | some a => s!"*{a}" :: ds
+        | none => ds
+      "(" ++ String.intercalate ", " parts ++ ")"
+
   instance : ToString BaseType where
     toString
-      | BaseType.arr m n => s!"({m}, {n})"
+      | BaseType.arr s => toString s
 
   instance : ToString TypeAtom where
     toString
@@ -231,20 +267,22 @@ section open_type_syntax
 
     /- Surface syntax for type schemes: `[sch| forall ?0 ?1, ?0 -> ?1]`, or
   `[sch| nat -> bool]` for a monomorphic one (empty binder list). -/
-  syntax "[sch| " "forall " (("?" num)*) (("#" num)*) ", " ty "]" : term
+  syntax "[sch| " "forall " (("?" num)*) (("#" num)*) (("*" num)*) ", " ty "]" : term
   syntax "[sch| " ty "]" : term
 
   macro_rules
-  | `([sch| forall $[?$ns:num]* $[#$ms:num]*, $t]) =>
-      `({ bound := ⟨[$[$ns],*], [$[$ms],*]⟩, body := [ty| $t] : TypeScheme })
+  | `([sch| forall $[?$ns:num]* $[#$ms:num]* $[*$ks:num]*, $t]) =>
+      `({ bound := ⟨[$[$ns],*], [$[$ms],*], [$[$ks],*]⟩, body := [ty| $t] : TypeScheme })
   | `([sch| $t:ty])                   => `({ bound := Vars.empty, body := [ty| $t] : TypeScheme })
 
   /- Print schemes back in that syntax. Monomorphic schemes print as bare types,
   matching how OCaml hides the quantifier. -/
   def TypeScheme.toString (σ : TypeScheme) : String :=
   match σ.bound with
-  | ⟨[], []⟩ => ToString.toString σ.body
-  | ⟨ts, ds⟩ => "forall " ++ String.intercalate " " (ts.map (s!"?{·}")) ++ String.intercalate " " (ds.map (s!"#{·}"))  ++ ", " ++ ToString.toString σ.body
+  | ⟨[], [], []⟩ => ToString.toString σ.body
+  | ⟨ts, ds, ss⟩ =>
+    "forall " ++ String.intercalate " " (ts.map (s!"?{·}") ++ ds.map (s!"#{·}") ++ ss.map (s!"*{·}"))
+      ++ ", " ++ ToString.toString σ.body
 
   instance : ToString TypeScheme := ⟨TypeScheme.toString⟩
   instance : Repr TypeScheme := ⟨fun σ _ => TypeScheme.toString σ⟩
@@ -254,17 +292,23 @@ section open_type_syntax
   #eval [sch| (2, 2) -> ?3]                       -- monomorphic, bound = []
   #eval [sch| forall ?0, (4, 4)]                   -- representable but generalize won't build it
   #eval [sch| forall ?0 #0 #1, (4, 4) -> (#0, #1) -> ?0]
+  #eval [sch| forall *0, (*0) -> (*0)]            -- elementwise, any rank
+  #eval [sch| forall #0 *0, (*0, #0) -> (*0)]     -- reduce the last axis
 
 end open_type_syntax
 
 def freshT : InferM Nat := do -- get a fresh unused type variable
-  let (n, m) ← get
-  set (n + 1, m)
+  let (n, m, k) ← get
+  set (n + 1, m, k)
   return n
 def freshD : InferM Nat := do -- get a fresh unused dimension variable
-  let (n, m) ← get
-  set (n, m + 1)
+  let (n, m, k) ← get
+  set (n, m + 1, k)
   return m
+def freshS : InferM Nat := do -- get a fresh unused shape variable
+  let (n, m, k) ← get
+  set (n, m, k + 1)
+  return k
 def occurs (v : Nat) (e : OpenType) : Bool :=
   match e with
   | .base (.var x) => x = v
@@ -290,9 +334,10 @@ def Env.free (Γ : Env) : Vars :=
 
 -- initial environment with types of built-ins
 abbrev initialEnv := Env.ofList [
-  ("*", [sch| forall #0 #1 #2, (#0, #1) -> (#1, #2) -> (#0, #2)]),
-  ("+", [sch| forall #0 #1, (#0, #1) -> (#0, #1) -> (#0, #1)]),
-  ("I", [sch| forall #0, (#0, #0)])
+  ("*", [sch| forall #0 #1 #2, (#0, #1) -> (#1, #2) -> (#0, #2)]),   -- matrix product: rank 2
+  ("+", [sch| forall *0, (*0) -> (*0) -> (*0)]),                     -- elementwise: any rank
+  ("I", [sch| forall #0, (#0, #0)]),
+  ("sum", [sch| forall #0 *0, (*0, #0) -> (*0)])                     -- reduce the last axis
 ]
 abbrev Env.extendInitial (Γ : Env) := initialEnv.union Γ
 
@@ -301,29 +346,42 @@ abbrev Env.extendInitial (Γ : Env) := initialEnv.union Γ
 structure Subst where
   tys : List (Nat × OpenType) -- apply right to left
   dims : List (Nat × Dim)
+  shapes : List (Nat × Shape) := []
 deriving Nonempty
-def Subst.singletonT (v : Nat) (t : OpenType) : Subst := Subst.mk [(v, t)] []
-def Subst.singletonD (v : Nat) (d : Dim) : Subst := Subst.mk [] [(v, d)]
-def Subst.empty : Subst := Subst.mk [] []
+def Subst.singletonT (v : Nat) (t : OpenType) : Subst := Subst.mk [(v, t)] [] []
+def Subst.singletonD (v : Nat) (d : Dim) : Subst := Subst.mk [] [(v, d)] []
+def Subst.singletonS (v : Nat) (s : Shape) : Subst := Subst.mk [] [] [(v, s)]
+def Subst.empty : Subst := Subst.mk [] [] []
 def Dim.subst (d : Dim) (S : Subst) : Dim :=
   match d with
   | .const _ => d
   | .var x => match S.dims.lookup x with
     | some d' => d'
     | none => d
+/- Substituting a shape variable splices the replacement in front of the known
+  dims: `{[2,3] / α} (α ++ [#0]) = [2, 3, #0]`. -/
+def Shape.subst (s : Shape) (S : Subst) : Shape :=
+  let ds := s.dims.map (·.subst S)
+  match s.svar with
+  | none => ⟨none, ds⟩
+  | some a => match S.shapes.lookup a with
+    | some s' => ⟨s'.svar, s'.dims ++ ds⟩
+    | none => ⟨some a, ds⟩
 def type.subst (t : OpenType) (S : Subst) : OpenType :=
   match t with
   | .base (.var x) => match S.tys.lookup x with
     | some t' => t'
     | none => t
-  | .base (.const (.arr m n)) => .base (.const (.arr (m.subst S) (n.subst S))) -- dim subst
+  | .base (.const (.arr s)) => .base (.const (.arr (s.subst S))) -- dim/shape subst
   | .arrow t1 t2 => type.arrow (t1.subst S) (t2.subst S)
 def Subst.compose (S1 S2 : Subst) : Subst :=  -- apply S2 then S1
   { tys := S1.tys.map (λ (x, t) => (x, t.subst S2)) ++ S2.tys,  -- apply S2 into S1, so the composition is idempotent
-    dims := S1.dims.map (λ (x, d) => (x, d.subst S2)) ++ S2.dims}
+    dims := S1.dims.map (λ (x, d) => (x, d.subst S2)) ++ S2.dims,
+    shapes := S1.shapes.map (λ (x, s) => (x, s.subst S2)) ++ S2.shapes}
 def Subst.restrict (S : Subst) (bound : Vars) : Subst := -- drop these vars
   { tys := S.tys.filter (λ (x, _) => !bound.tys.contains x),
-    dims := S.dims.filter (λ (x, _) => !bound.dims.contains x)}
+    dims := S.dims.filter (λ (x, _) => !bound.dims.contains x),
+    shapes := S.shapes.filter (λ (x, _) => !bound.shapes.contains x)}
 def TypeScheme.subst (σ : TypeScheme) (S : Subst) : TypeScheme :=
   { σ with body := σ.body.subst (S.restrict σ.bound) } --Subst should never overwrite a bound variable (generalize should prevent this too)
 def Env.subst (Γ : Env) (S : Subst) : Env :=
@@ -348,12 +406,41 @@ def unifyDims (m1 m2 : Dim) : Error Subst :=
   match m1, m2 with
   | .var x, d | d, .var x => .ok (Subst.singletonD x d)
   | .const x, .const y => if x = y then .ok (Subst.empty) else throw ErrorT.fail
+/- Shapes are unified aligned from the *right*, since a leading shape variable
+absorbs whatever extra leading dims the other side has:
+  `α ++ [#0]  ~  [2, 3, 4]`  gives  `α := [2, 3]`, `#0 := 4`.
+`unifyRevShape v1 v2 S r1 r2` unifies `v1 ++ reverse r1` with `v2 ++ reverse r2`,
+so the dims that must line up are at the heads of `r1`, `r2`. `S` is the
+substitution solved so far, applied lazily to each pair as it is reached. -/
+def unifyRevShape (v1 v2 : Option Nat) (S : Subst) : List Dim → List Dim → Error Subst
+  | d1 :: r1, d2 :: r2 => do
+    let S1 ← unifyDims (d1.subst S) (d2.subst S)
+    unifyRevShape v1 v2 (Subst.compose S1 S) r1 r2
+  | [], [] =>
+    match v1, v2 with
+    | none, none => .ok S
+    | some a, none | none, some a => .ok (Subst.compose (Subst.singletonS a ⟨none, []⟩) S)
+    | some a, some b =>
+      if a = b then .ok S
+      else .ok (Subst.compose (Subst.singletonS a ⟨some b, []⟩) S)
+  | rest, [] =>
+    -- the left shape has extra leading dims, so the right one must be a variable
+    match v2 with
+    | none => throw ErrorT.fail                       -- ranks disagree
+    | some b => if v1 = some b then throw ErrorT.fail -- occurs check: b ++ rest ~ b
+                else .ok (Subst.compose (Subst.singletonS b ⟨v1, (rest.map (·.subst S)).reverse⟩) S)
+  | [], rest =>
+    match v1 with
+    | none => throw ErrorT.fail
+    | some a => if v2 = some a then throw ErrorT.fail
+                else .ok (Subst.compose (Subst.singletonS a ⟨v2, (rest.map (·.subst S)).reverse⟩) S)
+
+def unifyShape (s1 s2 : Shape) : Error Subst :=
+  unifyRevShape s1.svar s2.svar Subst.empty s1.dims.reverse s2.dims.reverse
+
 def unifyShapes (a b : BaseType) : Error Subst :=
   match a, b with
-  | .arr m1 n1, .arr m2 n2 => do
-    let S1 ← unifyDims m1 m2
-    let S2 ← unifyDims n1 n2
-    return Subst.compose S1 S2
+  | .arr s1, .arr s2 => unifyShape s1 s2
 
 /- Termination measure for `unify`. -/
 
@@ -450,7 +537,7 @@ theorem mem_tyVars_subst_singletonT {a x : Nat} {t t' : OpenType}
         exact Or.inl ⟨by simp [type.tyVars], hy⟩
     | const c =>
       cases c with
-      | arr m n => simp [type.subst, type.tyVars] at h
+      | arr s => simp [type.subst, type.tyVars] at h
   | arrow t1 t2 ih1 ih2 =>
     simp [type.subst, type.tyVars] at h
     rcases h with h | h
@@ -467,7 +554,7 @@ theorem tyVars_subst_of_tys_nil {S : Subst} (hS : S.tys = []) (t : OpenType) :
   | base b =>
     cases b with
     | var y => simp [type.subst, hS, type.tyVars]
-    | const c => cases c with | arr m n => simp [type.subst, type.tyVars]
+    | const c => cases c with | arr s => simp [type.subst, type.tyVars]
   | arrow t1 t2 ih1 ih2 => simp [type.subst, type.tyVars, ih1, ih2]
 
 theorem size_subst_of_tys_nil {S : Subst} (hS : S.tys = []) (t : OpenType) :
@@ -476,7 +563,7 @@ theorem size_subst_of_tys_nil {S : Subst} (hS : S.tys = []) (t : OpenType) :
   | base b =>
     cases b with
     | var y => simp [type.subst, hS, type.size]
-    | const c => cases c with | arr m n => simp [type.subst, type.size]
+    | const c => cases c with | arr s => simp [type.subst, type.size]
   | arrow t1 t2 ih1 ih2 => simp [type.subst, type.size, ih1, ih2]
 
 theorem unifyDims_tys_nil {m1 m2 : Dim} {S : Subst} (h : unifyDims m1 m2 = .ok S) :
@@ -486,21 +573,43 @@ theorem unifyDims_tys_nil {m1 m2 : Dim} {S : Subst} (h : unifyDims m1 m2 = .ok S
       | (subst h; rfl)
       | (split at h <;> simp_all [Subst.empty] <;> (subst h; rfl))
 
+theorem unifyRevShape_tys_nil {v1 v2 : Option Nat} {S S' : Subst} {r1 r2 : List Dim}
+    (hS : S.tys = []) (h : unifyRevShape v1 v2 S r1 r2 = .ok S') : S'.tys = [] := by
+  induction r1 generalizing r2 S S' with
+  | nil =>
+    cases r2 with
+    | nil =>
+      simp only [unifyRevShape] at h
+      split at h <;> (try split at h) <;>
+        simp_all [Subst.compose, Subst.singletonS] <;> (subst h; rfl)
+    | cons d2 r2 =>
+      simp only [unifyRevShape] at h
+      split at h
+      · simp at h
+      · split at h
+        · simp at h
+        · simp_all [Subst.compose, Subst.singletonS] <;> (subst h; rfl)
+  | cons d1 r1 ih =>
+    cases r2 with
+    | nil =>
+      simp only [unifyRevShape] at h
+      split at h
+      · simp at h
+      · split at h
+        · simp at h
+        · simp_all [Subst.compose, Subst.singletonS] <;> (subst h; rfl)
+    | cons d2 r2 =>
+      simp only [unifyRevShape, bind, Except.bind] at h
+      split at h
+      · simp at h
+      · next hd =>
+        exact ih (by simp [Subst.compose, unifyDims_tys_nil hd, hS]) h
+
 theorem unifyShapes_tys_nil {a b : BaseType} {S : Subst} (h : unifyShapes a b = .ok S) :
     S.tys = [] := by
   cases a with
-  | arr m1 n1 => cases b with
-    | arr m2 n2 =>
-      simp only [unifyShapes, bind, Except.bind, pure, Except.pure] at h
-      split at h
-      · simp at h
-      · next h1 =>
-        split at h
-        · simp at h
-        · next h2 =>
-          simp only [Except.ok.injEq] at h
-          subst h
-          simp [Subst.compose, unifyDims_tys_nil h1, unifyDims_tys_nil h2]
+  | arr s1 => cases b with
+    | arr s2 => exact unifyRevShape_tys_nil rfl (by simpa [unifyShapes, unifyShape] using h)
 
 theorem constraintsSize_substConstraints {S : Subst} (hS : S.tys = []) (C : List Constraint) :
     constraintsSize (substConstraints C S) = constraintsSize C := by
@@ -642,7 +751,11 @@ def instantiate (σ : TypeScheme) : InferM OpenType := do
     let n' ← freshD
     return (m', Dim.var n')
   )
-  let S := Subst.mk fresh_tys fresh_dims
+  let fresh_shapes ← σ.bound.shapes.mapM (λ a' => do
+    let b' ← freshS
+    return (a', ({ svar := some b', dims := [] } : Shape))
+  )
+  let S := Subst.mk fresh_tys fresh_dims fresh_shapes
   return σ.body.subst S
 
 -- generalize [name] into a universally quantified variable, return the modified env
@@ -694,17 +807,21 @@ def buildConstraints (e : Expr) (Γ : Env) : InferM (OpenType × List Constraint
     return (t2, C1 ++ C2)
 
 def runBuildConstraints (e : Expr) (Γ : Env := initialEnv) : Error (OpenType × List Constraint) :=
-  (buildConstraints e Γ).run' (0, 0)
+  (buildConstraints e Γ).run' (0, 0, 0)
 
 
 -- reduce open TVars like ?2 down to the lowest distinct naturals
 def lowerVars (t : OpenType) : OpenType :=
   let rnT := t.Vars.tys.zipIdx
   let rnD := t.Vars.dims.zipIdx
-  t.subst { tys := rnT.map (λ (x, y) => (x, [ty| ?(y)])), dims := rnD.map (λ (x, y) => (x, Dim.var y))}
+  let rnS := t.Vars.shapes.zipIdx
+  t.subst { tys := rnT.map (λ (x, y) => (x, [ty| ?(y)])),
+            dims := rnD.map (λ (x, y) => (x, Dim.var y)),
+            shapes := rnS.map (λ (x, y) => (x, ({ svar := some y, dims := [] } : Shape)))}
 
 #eval lowerVars [ty| ?2 -> ?3]
 #eval lowerVars [ty| ?5 -> ?3 -> (#0, #4)]
+#eval lowerVars [ty| (*3, #4) -> (*3)]
 
 -- top level function, returns the inferred type
 def infer (e : Expr) (Γ : Env := initialEnv) : Error OpenType := do
@@ -732,6 +849,15 @@ section testing
     ("h",  [ty| (2, 3) -> (3, 2)]),
     ("g",  [sch| forall #0 #1, (#0, #1) -> (#0, #1)]),   -- shape-preserving map
     ("tr", [sch| forall #0 #1, (#0, #1) -> (#1, #0)]),   -- transpose
+    -- arrays of rank other than 2
+    ("sc",  [ty| ()]),                                   -- scalar
+    ("v4",  [ty| (4)]),                                  -- vectors
+    ("v4b", [ty| (4)]),
+    ("v5",  [ty| (5)]),
+    ("t3",  [ty| (2, 3, 4)]),                            -- rank 3
+    ("t3b", [ty| (2, 3, 4)]),
+    ("t4",  [ty| (9, 2, 3, 4)]),                         -- rank 4
+    ("last", [sch| forall #0 *0, (*0, #0) -> (#0)]),     -- keeps only the last axis
   ]
 
   macro "#test " e:term " : " t:term : command => `(
@@ -788,7 +914,7 @@ constraints and return (2,5). Here B is a lambda-bound variable. -/
 #test [lang| I] : (.ok [ty| (#0, #0)])        -- stays fully polymorphic
 #test [lang| x + I] : (.ok [ty| (2, 2)])      -- I instantiates to (2,2)
 #test [lang| I + x] : (.ok [ty| (2, 2)])
-#test [lang| a + I] : (.ok [ty| (2, 3)])      -- I is not square-only
+#test [lang| a + I] : fail                    -- I is square, a is (2,3)
 #test [lang| a * I] : (.ok [ty| (2, #0)])  -- inner solved, outer free
 #test [lang| I * a] : (.ok [ty| (2, 3)])
 #test [lang| I * I] : (.ok [ty| (#0, #0)])
@@ -805,7 +931,7 @@ constraints and return (2,5). Here B is a lambda-bound variable. -/
 #test [lang| fun v => v + x] : (.ok [ty| (2, 2) -> (2, 2)])
 #test [lang| fun v => v + a] : (.ok [ty| (2, 3) -> (2, 3)])
 -- #test [lang| fun v => v + I] : (.ok [ty| (#0, #1) -> (#0, #1)])
-#test [lang| fun v => fun w => v + w] : (.ok [ty| (#0, #1) -> (#0, #1) -> (#0, #1)])
+#test [lang| fun v => fun w => v + w] : (.ok [ty| (*0) -> (*0) -> (*0)])
 #test [lang| fun v => v * a] : (.ok [ty| (#0, 2) -> (#0, 3)])
 #test [lang| fun v => a * v] : (.ok [ty| (3, #0) -> (2, #0)])
 
@@ -832,10 +958,10 @@ generalize to a shape-preserving function, then be usable at a chosen shape. -/
 #test [lang| let ff = fun v => v + I in ff]
   : (.ok [ty| (#0, #0) -> (#0, #0)])
 #test [lang| let ff = fun v => v + I in ff x] : (.ok [ty| (2, 2)])
-#test [lang| let ff = fun v => v + I in ff a] : (.ok [ty| (2, 2)])
+#test [lang| let ff = fun v => v + I in ff a] : fail  -- a is not square
 -- the payoff: one binding used at two different shapes
-#test [lang| let ff = fun v => v + I in let p = ff x in ff a]
-  : (.ok [ty| (2, 2)])
+#test [lang| let ff = fun v => v + I in let p = ff x in ff z]
+  : (.ok [ty| (3, 3)])
 -- monomorphic contrast: this one is pinned to (2,2) by x
 #test [lang| let ff = fun v => v + x in ff a] : fail
 
@@ -853,7 +979,38 @@ used at two shapes must fail, while the let-bound version above succeeds. -/
 -- variables free in the env must not be generalized
 #test [lang| fun w => let ff = fun v => w in ff x] : (.ok [ty| ?0 -> ?0])
 #test [lang| fun w => let ff = fun v => w in (ff x) + (ff a)]
-  : (.ok [ty| (#0, #1) -> (#0, #1)])
+  : (.ok [ty| (*0) -> (*0)])
+
+/- ---------- arbitrary rank ---------- -/
+#test [lang| sc] : (.ok [ty| ()])
+#test [lang| v4] : (.ok [ty| (4)])
+#test [lang| t3] : (.ok [ty| (2, 3, 4)])
+-- `+` is rank polymorphic, but the two shapes must still agree exactly
+#test [lang| sc + sc] : (.ok [ty| ()])
+#test [lang| v4 + v4b] : (.ok [ty| (4)])
+#test [lang| v4 + v5] : fail                  -- (4) vs (5)
+#test [lang| t3 + t3b] : (.ok [ty| (2, 3, 4)])
+#test [lang| t3 + t4] : fail                  -- rank 3 vs rank 4
+#test [lang| t3 + v4] : fail                  -- no implicit broadcasting yet
+#test [lang| t3 + a] : fail                   -- rank 3 vs rank 2
+#test [lang| t3 * t3] : fail                  -- `*` is still rank 2 only
+-- a shape variable absorbs any leading frame, the trailing dims still unify
+#test [lang| sum t3] : (.ok [ty| (2, 3)])
+#test [lang| sum (sum t3)] : (.ok [ty| (2)])
+#test [lang| sum (sum (sum t3))] : (.ok [ty| ()])
+#test [lang| sum sc] : fail                   -- nothing to reduce
+#test [lang| sum t4] : (.ok [ty| (9, 2, 3)])
+#test [lang| sum v4] : (.ok [ty| ()])
+#test [lang| last t3] : (.ok [ty| (4)])
+#test [lang| last sc] : fail
+#test [lang| (sum t3) + a] : (.ok [ty| (2, 3)])
+#test [lang| (sum t3) + v4] : fail
+-- rank stays polymorphic when nothing pins it down
+#test [lang| fun vv => sum vv] : (.ok [ty| (*0, #0) -> (*0)])
+#test [lang| fun vv => vv + t3] : (.ok [ty| (2, 3, 4) -> (2, 3, 4)])
+#test [lang| fun vv => (sum vv) + a] : (.ok [ty| (2, 3, #0) -> (2, 3)])
+#test [lang| let s2 = fun vv => sum (sum vv) in let p = s2 t3 in s2 t4]
+  : (.ok [ty| (9, 2)])
 
 /- ---------- occurs check ---------- -/
 #test [lang| fun s => s s] : fail
