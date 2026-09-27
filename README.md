@@ -42,6 +42,5 @@ Short term
 Long term
 
 - parser of actual text file
-- prove termination of unify
 - semantics
 - some kind of proof of correctness
