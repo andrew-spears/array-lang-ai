@@ -355,30 +355,282 @@ def unifyShapes (a b : BaseType) : Error Subst :=
     let S2 ← unifyDims n1 n2
     return Subst.compose S1 S2
 
--- return (the most general) substitution that unifies all constraints
-partial def unify (C: List Constraint) : Error Subst :=
+/- Termination measure for `unify`. -/
+
+def type.tyVars : OpenType → List Nat
+  | .base (.var x) => [x]
+  | .base (.const _) => []
+  | .arrow t1 t2 => t1.tyVars ++ t2.tyVars
+
+def constraintsTyVars : List Constraint → List Nat
+  | [] => []
+  | (t1, t2) :: C => t1.tyVars ++ t2.tyVars ++ constraintsTyVars C
+
+def type.size : OpenType → Nat
+  | .base _ => 1
+  | .arrow t1 t2 => 1 + t1.size + t2.size
+
+def constraintsSize : List Constraint → Nat
+  | [] => 0
+  | (t1, t2) :: C => t1.size + t2.size + constraintsSize C
+
+def dedupNats : List Nat → List Nat
+  | [] => []
+  | x :: xs =>
+    let d := dedupNats xs
+    if x ∈ d then d else x :: d
+
+theorem mem_dedupNats {a : Nat} {l : List Nat} : a ∈ dedupNats l ↔ a ∈ l := by
+  induction l generalizing a with
+  | nil => simp [dedupNats]
+  | cons x xs ih =>
+    simp only [dedupNats]
+    split
+    · next h =>
+      have hx : x ∈ xs := ih.mp h
+      simp only [List.mem_cons, ih]
+      exact ⟨Or.inr, fun h' => h'.elim (fun he => he ▸ hx) id⟩
+    · simp [ih]
+
+theorem nodup_dedupNats (l : List Nat) : (dedupNats l).Nodup := by
+  induction l with
+  | nil => simp [dedupNats]
+  | cons x xs ih =>
+    simp only [dedupNats]
+    split
+    · exact ih
+    · next h => exact List.nodup_cons.mpr ⟨h, ih⟩
+
+def numTyVars (C : List Constraint) : Nat := (dedupNats (constraintsTyVars C)).length
+
+theorem numTyVars_le {C₁ C₂ : List Constraint}
+    (h : ∀ a, a ∈ constraintsTyVars C₁ → a ∈ constraintsTyVars C₂) :
+    numTyVars C₁ ≤ numTyVars C₂ :=
+  (nodup_dedupNats _).length_le_of_subset
+    (fun _ ha => mem_dedupNats.mpr (h _ (mem_dedupNats.mp ha)))
+
+theorem numTyVars_lt {C₁ C₂ : List Constraint} {x : Nat}
+    (h : ∀ a, a ∈ constraintsTyVars C₁ → a ∈ constraintsTyVars C₂)
+    (hx₂ : x ∈ constraintsTyVars C₂) (hx₁ : x ∉ constraintsTyVars C₁) :
+    numTyVars C₁ < numTyVars C₂ := by
+  have hnodup : (x :: dedupNats (constraintsTyVars C₁)).Nodup :=
+    List.nodup_cons.mpr ⟨fun hc => hx₁ (mem_dedupNats.mp hc), nodup_dedupNats _⟩
+  have hsub : x :: dedupNats (constraintsTyVars C₁) ⊆ dedupNats (constraintsTyVars C₂) := by
+    intro a ha
+    rcases List.mem_cons.mp ha with rfl | ha
+    · exact mem_dedupNats.mpr hx₂
+    · exact mem_dedupNats.mpr (h _ (mem_dedupNats.mp ha))
+  have hlen := hnodup.length_le_of_subset hsub
+  simp only [List.length_cons] at hlen
+  unfold numTyVars
+  omega
+
+theorem occurs_iff_mem (v : Nat) (t : OpenType) : occurs v t = true ↔ v ∈ t.tyVars := by
+  induction t with
+  | base b =>
+    cases b with
+    | var y => simp [occurs, type.tyVars, eq_comm]
+    | const c => simp [occurs, type.tyVars]
+  | arrow t1 t2 ih1 ih2 => simp [occurs, type.tyVars, ih1, ih2]
+
+theorem mem_tyVars_subst_singletonT {a x : Nat} {t t' : OpenType}
+    (h : a ∈ (t'.subst (Subst.singletonT x t)).tyVars) :
+    (a ∈ t'.tyVars ∧ a ≠ x) ∨ a ∈ t.tyVars := by
+  induction t' with
+  | base b =>
+    cases b with
+    | var y =>
+      by_cases hy : y = x
+      · subst hy
+        simp [type.subst, Subst.singletonT] at h
+        exact Or.inr h
+      · have hyb : (y == x) = false := by simp [hy]
+        simp [type.subst, Subst.singletonT, List.lookup, hyb, type.tyVars] at h
+        subst h
+        exact Or.inl ⟨by simp [type.tyVars], hy⟩
+    | const c =>
+      cases c with
+      | arr m n => simp [type.subst, type.tyVars] at h
+  | arrow t1 t2 ih1 ih2 =>
+    simp [type.subst, type.tyVars] at h
+    rcases h with h | h
+    · rcases ih1 h with ⟨h1, h2⟩ | h1
+      · exact Or.inl ⟨by simp [type.tyVars, h1], h2⟩
+      · exact Or.inr h1
+    · rcases ih2 h with ⟨h1, h2⟩ | h1
+      · exact Or.inl ⟨by simp [type.tyVars, h1], h2⟩
+      · exact Or.inr h1
+
+theorem tyVars_subst_of_tys_nil {S : Subst} (hS : S.tys = []) (t : OpenType) :
+    (t.subst S).tyVars = t.tyVars := by
+  induction t with
+  | base b =>
+    cases b with
+    | var y => simp [type.subst, hS, type.tyVars]
+    | const c => cases c with | arr m n => simp [type.subst, type.tyVars]
+  | arrow t1 t2 ih1 ih2 => simp [type.subst, type.tyVars, ih1, ih2]
+
+theorem size_subst_of_tys_nil {S : Subst} (hS : S.tys = []) (t : OpenType) :
+    (t.subst S).size = t.size := by
+  induction t with
+  | base b =>
+    cases b with
+    | var y => simp [type.subst, hS, type.size]
+    | const c => cases c with | arr m n => simp [type.subst, type.size]
+  | arrow t1 t2 ih1 ih2 => simp [type.subst, type.size, ih1, ih2]
+
+theorem unifyDims_tys_nil {m1 m2 : Dim} {S : Subst} (h : unifyDims m1 m2 = .ok S) :
+    S.tys = [] := by
+  cases m1 <;> cases m2 <;> simp [unifyDims] at h <;>
+    first
+      | (subst h; rfl)
+      | (split at h <;> simp_all [Subst.empty] <;> (subst h; rfl))
+
+theorem unifyShapes_tys_nil {a b : BaseType} {S : Subst} (h : unifyShapes a b = .ok S) :
+    S.tys = [] := by
+  cases a with
+  | arr m1 n1 => cases b with
+    | arr m2 n2 =>
+      simp only [unifyShapes, bind, Except.bind, pure, Except.pure] at h
+      split at h
+      · simp at h
+      · next h1 =>
+        split at h
+        · simp at h
+        · next h2 =>
+          simp only [Except.ok.injEq] at h
+          subst h
+          simp [Subst.compose, unifyDims_tys_nil h1, unifyDims_tys_nil h2]
+
+theorem constraintsSize_substConstraints {S : Subst} (hS : S.tys = []) (C : List Constraint) :
+    constraintsSize (substConstraints C S) = constraintsSize C := by
+  induction C with
+  | nil => simp [substConstraints, constraintsSize]
+  | cons c C ih =>
+    cases c with
+    | mk t1 t2 =>
+      simp [substConstraints, constraintsSize, Constraint.subst,
+        size_subst_of_tys_nil hS] at *
+      omega
+
+theorem mem_constraintsTyVars_substConstraints {S : Subst} (hS : S.tys = [])
+    {a : Nat} {C : List Constraint} (h : a ∈ constraintsTyVars (substConstraints C S)) :
+    a ∈ constraintsTyVars C := by
+  induction C with
+  | nil => simp [substConstraints, constraintsTyVars] at h
+  | cons c C ih =>
+    cases c with
+    | mk t1 t2 =>
+      simp [substConstraints, constraintsTyVars, Constraint.subst,
+        tyVars_subst_of_tys_nil hS] at *
+      rcases h with h | h | h
+      · exact Or.inl h
+      · exact Or.inr (Or.inl h)
+      · exact Or.inr (Or.inr (ih h))
+
+theorem mem_constraintsTyVars_subst_singletonT {a x : Nat} {t : OpenType} {C : List Constraint}
+    (h : a ∈ constraintsTyVars (substConstraints C (Subst.singletonT x t))) :
+    (a ∈ constraintsTyVars C ∧ a ≠ x) ∨ a ∈ t.tyVars := by
+  induction C with
+  | nil => simp [substConstraints, constraintsTyVars] at h
+  | cons c C ih =>
+    cases c with
+    | mk t1 t2 =>
+      simp [substConstraints, constraintsTyVars, Constraint.subst] at h
+      rcases h with h | h | h
+      · rcases mem_tyVars_subst_singletonT h with ⟨h1, h2⟩ | h1
+        · exact Or.inl ⟨by simp [constraintsTyVars, h1], h2⟩
+        · exact Or.inr h1
+      · rcases mem_tyVars_subst_singletonT h with ⟨h1, h2⟩ | h1
+        · exact Or.inl ⟨by simp [constraintsTyVars, h1], h2⟩
+        · exact Or.inr h1
+      · rcases ih (by simpa [substConstraints, Constraint.subst] using h) with ⟨h1, h2⟩ | h1
+        · exact Or.inl ⟨by simp [constraintsTyVars, h1], h2⟩
+        · exact Or.inr h1
+
+theorem lexLt {a b c d : Nat} (h₁ : a ≤ c) (h₂ : a = c → b < d) :
+    Prod.Lex (· < ·) (· < ·) (a, b) (c, d) := by
+  rcases Nat.lt_or_ge a c with h | h
+  · exact .left _ _ h
+  · have hac : a = c := Nat.le_antisymm h₁ h
+    subst hac
+    exact .right _ (h₂ rfl)
+
+theorem numTyVars_subst_singletonT_lt {x : Nat} {t u1 u2 : OpenType} {C' : List Constraint}
+    (hocc : ¬ occurs x t = true)
+    (hx : x ∈ constraintsTyVars ((u1, u2) :: C'))
+    (ht : ∀ a, a ∈ t.tyVars → a ∈ constraintsTyVars ((u1, u2) :: C')) :
+    numTyVars (substConstraints C' (Subst.singletonT x t)) < numTyVars ((u1, u2) :: C') := by
+  refine numTyVars_lt (x := x) ?_ hx ?_
+  · intro a ha
+    rcases mem_constraintsTyVars_subst_singletonT ha with ⟨h1, _⟩ | h1
+    · simp [constraintsTyVars, h1]
+    · exact ht a h1
+  · intro hmem
+    rcases mem_constraintsTyVars_subst_singletonT hmem with ⟨_, hne⟩ | h1
+    · exact hne rfl
+    · exact hocc ((occurs_iff_mem x t).mpr h1)
+
+def unify (C: List Constraint) : Error Subst :=
   match C with
-  | [] => do return Subst.empty
+  | [] => .ok Subst.empty
   | (t1, t2) :: C' =>
-    let bindVar (x : Nat) (t : OpenType) (C' : List Constraint): Error Subst :=
-      if occurs x t then throw ErrorT.fail else do
-        let S := Subst.singletonT x t
-        let S' ← unify (substConstraints C' S)
-        return Subst.compose S S'
     match t1, t2 with
-    -- identical variables / identical constants: nothing to learn
     | .base (.var x), .base (.var y) =>
-      if x = y then unify C' else bindVar x t2 C'
-    | .base (.const a), .base (.const b) => do
-      let S ← unifyShapes a b
-      let S' ← unify (substConstraints C' S)
-      return Subst.compose S S'
-    -- a variable = anything else
-    | .base (.var x), t | t, .base (.var x) => bindVar x t C'
-    -- reduce
-    | .arrow t1 t2, .arrow t3 t4 =>
-      unify ((t1, t3) :: (t2, t4) :: C') -- push the two reduced constraints
+      if x = y then unify C'
+      else if occurs x (.base (.var y)) then throw ErrorT.fail
+      else
+        match unify (substConstraints C' (Subst.singletonT x (.base (.var y)))) with
+        | .error e => .error e
+        | .ok S' => .ok (Subst.compose (Subst.singletonT x (.base (.var y))) S')
+    | .base (.const a), .base (.const b) =>
+      match hS : unifyShapes a b with
+      | .error e => .error e
+      | .ok S =>
+        match unify (substConstraints C' S) with
+        | .error e => .error e
+        | .ok S' => .ok (Subst.compose S S')
+    | .base (.var x), t | t, .base (.var x) =>
+      if occurs x t then throw ErrorT.fail
+      else
+        match unify (substConstraints C' (Subst.singletonT x t)) with
+        | .error e => .error e
+        | .ok S' => .ok (Subst.compose (Subst.singletonT x t) S')
+    | .arrow a b, .arrow c d => unify ((a, c) :: (b, d) :: C')
     | _, _ => throw ErrorT.fail
+termination_by (numTyVars C, constraintsSize C)
+decreasing_by
+  · refine lexLt (numTyVars_le ?_) (fun _ => ?_)
+    · intro a ha
+      simp [constraintsTyVars, ha]
+    · simp only [constraintsSize, type.size]
+      omega
+  · refine Prod.Lex.left _ _ (numTyVars_subst_singletonT_lt (by assumption) ?_ ?_)
+    · simp [constraintsTyVars, type.tyVars]
+    · intro a ha
+      simp [constraintsTyVars, type.tyVars] at ha ⊢
+      simp [ha]
+  · refine lexLt (numTyVars_le ?_) (fun _ => ?_)
+    · intro a ha
+      have h1 := mem_constraintsTyVars_substConstraints (unifyShapes_tys_nil hS) ha
+      simp [constraintsTyVars, type.tyVars, h1]
+    · rw [constraintsSize_substConstraints (unifyShapes_tys_nil hS)]
+      simp only [constraintsSize, type.size]
+      omega
+  · refine Prod.Lex.left _ _ (numTyVars_subst_singletonT_lt (by assumption) ?_ ?_)
+    · simp [constraintsTyVars, type.tyVars]
+    · intro a ha
+      simp [constraintsTyVars, type.tyVars, ha]
+  · refine Prod.Lex.left _ _ (numTyVars_subst_singletonT_lt (by assumption) ?_ ?_)
+    · simp [constraintsTyVars, type.tyVars]
+    · intro a ha
+      simp [constraintsTyVars, type.tyVars, ha]
+  · refine lexLt (numTyVars_le ?_) (fun _ => ?_)
+    · intro a ha
+      simp only [constraintsTyVars, type.tyVars, List.mem_append] at ha ⊢
+      rcases ha with (h | h) | (h | h) | h <;> simp [h]
+    · simp only [constraintsSize, type.size]
+      omega
 
 -- replace all bound variables in a type scheme with fresh vars
 def instantiate (σ : TypeScheme) : InferM OpenType := do
